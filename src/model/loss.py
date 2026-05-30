@@ -44,7 +44,7 @@ def odsi_db_pw_ce_logprob_loss(raw_pred, raw_gt):
 
     # Class weights according to the number of pixels per class in ODSI-DB,
     # a higher number indicates less represented classes
-    class_weights = torch.cuda.FloatTensor([
+    class_weights = torch.tensor([
         0.9682632484506389, 0.9983340617620862, 0.9999394663490677, 
         0.9995276328275359, 0.9998907852100988, 0.9188844950588891, 
         0.9999902109476404, 0.9997049747997107, 0.9973278363209698, 
@@ -56,7 +56,7 @@ def odsi_db_pw_ce_logprob_loss(raw_pred, raw_gt):
         0.9998345270474653, 0.9957902617780788, 0.9875275587410823, 
         0.9997695198161124, 0.9879129304566572, 0.6864583697190043, 
         0.9769124622329116, 0.9681097270561285, 0.9996792888545647, 
-        0.9326207970711948, 0.9999083493782449])
+        0.9326207970711948, 0.9999083493782449], device=raw_pred.device)
 
     # Flatten predictions and labels
     bs = raw_pred.shape[0]
@@ -67,7 +67,7 @@ def odsi_db_pw_ce_logprob_loss(raw_pred, raw_gt):
     
     # Loop over the batch (each image might have different number of annotated
     # pixels)
-    ce_loss = torch.empty((bs))
+    ce_loss = torch.empty((bs), device=raw_pred.device)
     for i in range(bs):
         # Filter out those pixels without labels
         ann_idx = torch.sum(gt[i, ...], dim=0) == 1

@@ -1170,8 +1170,7 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
         remaining = np.arange(self.n_samples).tolist()
         
         # Get list of labels to check the classes that are present in each image
-        labels = [os.path.join(self.data_dir, im_dic['label']) \
-            for im_dic in self.dataset.data]
+        labels = [im_dic['label'] for im_dic in self.dataset.data]
 
         # Make a dictionary from each class to the indices of the images that
         # contain pixels of such class
@@ -1217,7 +1216,7 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
         return train_sampler, valid_sampler
         
     #@staticmethod
-    def collate_fn(self, batch, max_h=256, max_w=256):
+    def collate_fn(self, batch, max_h=512, max_w=512):
         """
         @brief This function hijacks the batch and crops all the elements of the
                batch randomly so that they are the same size. The minimum width
@@ -1291,11 +1290,16 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
             if item['image'].shape[2] < min_w:
                 min_w = item['image'].shape[2]
 
-        # Crop image for the 'rgbpixel' and 'spixel' cases due to memory and 
-        # speed restrictions
-        #if self.training:
+        # Crop images during training due to memory and speed restrictions.
+        # Full-resolution images are still used when the loader is in testing mode.
         mode = batch[0].get('mode')
-        if mode in ['rgbpixel', 'spixel_170']:
+        if self.training and mode in [
+            'rgbpixel', 'rgbimage', 'rgbpixel_test',
+            'spixel_51', 'simage_51',
+            'spixel_170', 'spixel_170_test', 'simage_170',
+            'spixel_204', 'simage_204',
+            'boiko',
+        ]:
             min_h = min(min_h, max_h)
             min_w = min(min_w, max_w)
 
@@ -1349,4 +1353,3 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
 
         return new_image, new_label
         
-

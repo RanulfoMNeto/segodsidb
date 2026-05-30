@@ -4,6 +4,8 @@
 @date   4 Jun 2021.
 """
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 import torch.utils.model_zoo

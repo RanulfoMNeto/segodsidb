@@ -161,8 +161,7 @@ class GenericMachine(torchseg.base.BaseMachine):
         self.data_loader.training = False 
 
         with torch.no_grad():
-            #for batch_idx, (data, target) in enumerate(self.valid_data_loader):
-            for batch_idx, raw_data in enumerate(self.data_loader):
+            for batch_idx, raw_data in enumerate(self.valid_data_loader):
                 data = raw_data['image'] 
                 target = raw_data['label'] 
                 data, target = data.to(self.device), target.to(self.device)
@@ -204,5 +203,4 @@ class GenericMachine(torchseg.base.BaseMachine):
             current = batch_idx
             total = self.len_epoch
         return base.format(current, total, 100.0 * current / total)
-
 

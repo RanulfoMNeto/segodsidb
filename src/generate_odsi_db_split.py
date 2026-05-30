@@ -152,12 +152,14 @@ def read_files(path):
     tiffs = [f for f in torchseg.utils.listdir(path) if '.tif' in f]
 
     # Get list of segmentation files
-    segs = [os.path.join(path, f) for f in tiffs if f.endswith('_masks.tif')]
+    seg_names = [f for f in tiffs if f.endswith('_masks.tif')]
 
     # Get list of image files (we ignore images without segmentation)
-    imgs = [f.replace('_masks.tif', '.tif') for f in segs]
+    img_names = [f.replace('_masks.tif', '.tif') for f in seg_names]
+    imgs = [os.path.join(path, f) for f in img_names]
+    segs = [os.path.join(path, f) for f in seg_names]
     for im in imgs:
-        assert(os.path.isfile(os.path.join(path, im)))
+        assert(os.path.isfile(im))
 
     return imgs, segs
 
@@ -258,7 +260,7 @@ def validate_random_split(split_dic,
 
 def copy_into_dir(file_list, dst_dir):
     """
-    @brief Copies the files in the list into the provided destination directory.
+    @brief Links the files in the list into the provided destination directory.
     @param[in]  file_list  List of paths to files.
     @param[in]  dst_dir    Path to the destination directory.
     @returns nothing.
@@ -266,7 +268,10 @@ def copy_into_dir(file_list, dst_dir):
     for src_path in file_list:
         filename = os.path.basename(src_path)
         dst_path = os.path.join(dst_dir, filename) 
-        shutil.copyfile(src_path, dst_path)
+        try:
+            os.link(src_path, dst_path)
+        except OSError:
+            shutil.copyfile(src_path, dst_path)
 
 
 def copy_data(split_dic, train_path, test_path):

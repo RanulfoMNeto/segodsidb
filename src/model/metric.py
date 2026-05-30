@@ -184,7 +184,7 @@ def odsi_db_monai_metric(pred, gt, metric_name, ignore_labels=[], thresh=0.5):
 
         # NOTE: Every image in the batch can have a different number of 
         #       annotated pixels
-        conf_mat = torch.zeros((1, chan, 4)).cuda()
+        conf_mat = torch.zeros((1, chan, 4), device=pred.device)
         for i in range(bs):
             # Get tensor of booleans of valid annotated pixels (i.e. they
             # have been assigned to only one class)
