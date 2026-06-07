@@ -10,6 +10,38 @@ import torch
 import monai.losses
 
 
+def _reconstruction_from_output(pred):
+    if isinstance(pred, dict):
+        return pred['reconstruction']
+    return pred
+
+
+def get_loss_function(loss_config):
+    """
+    @brief Build a loss function from either a legacy string name or a config
+           object with explicit arguments.
+    @details Examples:
+             "sad_reconstruction_loss"
+             {"type": "sad_mse_reconstruction_loss",
+              "args": {"mse_weight": 1.0}}
+    """
+    if isinstance(loss_config, str):
+        return getattr(sys.modules[__name__], loss_config)
+
+    if isinstance(loss_config, dict):
+        loss_type = loss_config['type']
+        loss_args = loss_config.get('args', {})
+        loss_fn = getattr(sys.modules[__name__], loss_type)
+
+        def configured_loss(pred, gt):
+            return loss_fn(pred, gt, **loss_args)
+
+        configured_loss.__name__ = loss_type
+        return configured_loss
+
+    raise TypeError('Unsupported loss config: {}'.format(loss_config))
+
+
 def nll_loss(pred, gt):
     """
     @brief Negative log-likelihood loss (also called multi-class cross entropy). 
@@ -18,6 +50,38 @@ def nll_loss(pred, gt):
     @returns a scalar with the mean loss.
     """ 
     return torch.nn.functional.nll_loss(pred, gt)
+
+
+def sad_reconstruction_loss(pred, gt, eps=1e-8):
+    """
+    @brief Spectral angle distance loss for hyperspectral reconstruction.
+    @param[in] pred Dict returned by CNNAEU or a reconstruction tensor,
+                    shape (B, C, H, W).
+    @param[in] gt   Target reflectance tensor, shape (B, C, H, W).
+    """
+    pred = _reconstruction_from_output(pred)
+
+    pred_norm = torch.nn.functional.normalize(pred, p=2, dim=1, eps=eps)
+    gt_norm = torch.nn.functional.normalize(gt, p=2, dim=1, eps=eps)
+    cosine = torch.sum(pred_norm * gt_norm, dim=1)
+    cosine = torch.clamp(cosine, min=-1.0 + eps, max=1.0)
+    cosine = torch.where(cosine > 1.0 - 1e-6,
+                         torch.ones_like(cosine), cosine)
+    sad = torch.acos(cosine)
+
+    return sad.mean()
+
+
+def sad_mse_reconstruction_loss(pred, gt, mse_weight=1.0, eps=1e-8):
+    """
+    @brief Hybrid reconstruction loss for hyperspectral unmixing.
+    @details The SAD term preserves spectral shape, while the MSE term
+             penalizes radiometric scale errors in reflectance.
+    """
+    reconstruction = _reconstruction_from_output(pred)
+    sad = sad_reconstruction_loss(reconstruction, gt, eps=eps)
+    mse = torch.nn.functional.mse_loss(reconstruction, gt)
+    return sad + float(mse_weight) * mse
 
 
 def focal_loss(pred, gt):

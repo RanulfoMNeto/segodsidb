@@ -363,6 +363,82 @@ class VectorUnet(torchseg.base.BaseModel):
         return F.log_softmax(upconv1, dim=1)
 
 
+class CNNAEU(torchseg.base.BaseModel):
+    """
+    @brief PyTorch port of the CNNAEU hyperspectral unmixing autoencoder.
+    @details The encoder estimates abundance maps and the linear, nonnegative
+             decoder reconstructs reflectance spectra from those abundances.
+    """
+
+    def __init__(self, in_channels=170, num_endmembers=10, encoder_filters=48,
+            encoder_kernel_size=3, decoder_kernel_size=13, softmax_scale=3.0,
+            dropout=0.2, negative_slope=0.02, initializer_std=0.3):
+        super().__init__()
+
+        encoder_padding = encoder_kernel_size // 2
+        decoder_padding = decoder_kernel_size // 2
+        self.softmax_scale = softmax_scale
+        self.decoder_kernel_area = decoder_kernel_size * decoder_kernel_size
+
+        self.encoder_conv1 = torch.nn.Conv2d(
+            in_channels, encoder_filters, encoder_kernel_size, stride=1,
+            padding=encoder_padding, bias=False)
+        self.encoder_activation1 = torch.nn.LeakyReLU(
+            negative_slope=negative_slope)
+        self.encoder_bn1 = torch.nn.BatchNorm2d(encoder_filters)
+        self.encoder_dropout1 = torch.nn.Dropout2d(p=dropout)
+
+        self.encoder_conv2 = torch.nn.Conv2d(
+            encoder_filters, num_endmembers, kernel_size=1, stride=1,
+            padding=0, bias=False)
+        self.encoder_activation2 = torch.nn.LeakyReLU(
+            negative_slope=negative_slope)
+        self.encoder_bn2 = torch.nn.BatchNorm2d(num_endmembers)
+        self.encoder_dropout2 = torch.nn.Dropout2d(p=dropout)
+
+        self.decoder = torch.nn.Conv2d(
+            num_endmembers, in_channels, decoder_kernel_size, stride=1,
+            padding=decoder_padding, bias=False)
+
+        self._init_weights(initializer_std)
+        self.clamp_decoder_weights()
+
+    def _init_weights(self, initializer_std):
+        for module in [self.encoder_conv1, self.encoder_conv2, self.decoder]:
+            torch.nn.init.normal_(module.weight, mean=0.0,
+                                  std=initializer_std)
+
+    def clamp_decoder_weights(self):
+        with torch.no_grad():
+            self.decoder.weight.clamp_(min=0.0)
+
+    def get_endmembers(self):
+        return self.decoder.weight.mean(dim=(2, 3)).transpose(0, 1)
+
+    def decode_abundances(self, abundances):
+        return self.decoder(abundances) / self.decoder_kernel_area
+
+    def forward(self, x):
+        code = self.encoder_conv1(x)
+        code = self.encoder_activation1(code)
+        code = self.encoder_bn1(code)
+        code = self.encoder_dropout1(code)
+
+        code = self.encoder_conv2(code)
+        code = self.encoder_activation2(code)
+        code = self.encoder_bn2(code)
+        code = self.encoder_dropout2(code)
+
+        abundances = F.softmax(self.softmax_scale * code, dim=1)
+        reconstruction = self.decode_abundances(abundances)
+
+        return {
+            'reconstruction': reconstruction,
+            'abundances': abundances,
+            'endmembers': self.get_endmembers(),
+        }
+
+
 class DeepLabV3(torchseg.base.BaseModel):
 
     class ASPPConv(torch.nn.Sequential):

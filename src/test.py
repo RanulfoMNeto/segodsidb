@@ -60,6 +60,25 @@ palette = np.round(np.array([
        [0.21141543, 0.16505171, 0.53799316],
 ]) * 255.).astype(np.uint8)
 
+ARTICLE_TISSUE_CLASSES = [
+    "Skin", "Oral mucosa", "Enamel", "Tongue", "Lip", "Hard palate",
+    "Attached gingiva", "Soft palate", "Hair",
+]
+
+
+def article_tissue_class_indices(device=None):
+    idx2class = dl.OdsiDbDataLoader.OdsiDbDataset.classnames
+    class2idx = {y: x for x, y in idx2class.items()}
+    return torch.tensor([class2idx[x] for x in ARTICLE_TISSUE_CLASSES],
+                        device=device, dtype=torch.long)
+
+
+def classes_mask(class_map, class_indices):
+    mask = torch.zeros_like(class_map, dtype=torch.bool)
+    for class_idx in class_indices.tolist():
+        mask = torch.logical_or(mask, class_map == int(class_idx))
+    return mask
+
 
 def help(short_option):
     """
@@ -113,25 +132,21 @@ def image_based_accuracy(log_pred, gt, nclasses=35):
     pred = torch.reshape(pred, (nclasses, -1))
     gt = torch.reshape(gt, (nclasses, -1)) 
 
-    # List of classes considered
-    idx2class = dl.OdsiDbDataLoader.OdsiDbDataset.classnames
-    class2idx = {y: x for x, y in idx2class.items()}
-    relevant_class = ["Skin", "Oral mucosa", "Enamel", "Tongue", "Lip", "Hard palate", 
-                      "Attached gingiva", "Soft palate", "Hair"]
-    relevant_class_idx = torch.tensor([class2idx[x] for x in relevant_class])
+    y_pred = torch.argmax(pred, dim=0)
+    y_true = torch.argmax(gt, dim=0)
 
-    # Get only the annotated pixels
+    # Evaluate only annotated pixels whose true class belongs to the tissue
+    # subset reported in the paper. Predictions still compete over all 35
+    # classes, matching the trained output space.
     ann_idx = torch.sum(gt, dim=0) == 1
-    y_pred = pred[:, ann_idx]
-    y_true = gt[:, ann_idx]
+    relevant_idx = classes_mask(
+        y_true, article_tissue_class_indices(device=y_true.device))
+    valid_idx = torch.logical_and(ann_idx, relevant_idx)
+    if valid_idx.sum().item() == 0:
+        return float('nan')
 
-    # Discard non-relevant classes
-    y_pred = y_pred[relevant_class_idx, :]
-    y_true = y_true[relevant_class_idx, :]
-
-    # Get class index predictions 
-    y_pred = torch.argmax(y_pred, dim=0)
-    y_true = torch.argmax(y_true, dim=0)
+    y_pred = y_pred[valid_idx]
+    y_true = y_true[valid_idx]
     
     # Compute accuracy
     correct_predictions = (y_pred == y_true).float().sum()
@@ -199,18 +214,13 @@ def label2bgr(im, pred, gt):
     pred_sinchan[nan_idx, ...] = 0
     gt_sinchan[nan_idx, ...] = 0
 
-    # List of classes considered
-    idx2class = dl.OdsiDbDataLoader.OdsiDbDataset.classnames
-    class2idx = {y: x for x, y in idx2class.items()}
-    relevant_class = ["Skin", "Oral mucosa", "Enamel", "Tongue", "Lip", "Hard palate", 
-                      "Attached gingiva", "Soft palate", "Hair"]
-    relevant_class_idx = [class2idx[x] for x in relevant_class]
-
-    # Black out the non-relevant classes
-    for idx in relevant_class_idx:
-        pixels_of_this_class = gt_sinchan == (idx + 1)
-        pred_sinchan[pixels_of_this_class] = 0
-        gt_sinchan[pixels_of_this_class] = 0
+    # Black out annotations outside the tissue subset reported in the paper.
+    gt_class = torch.argmax(gt, dim=0)
+    relevant_idx = classes_mask(
+        gt_class, article_tissue_class_indices(device=gt_class.device))
+    valid_idx = torch.logical_and(torch.sum(gt, dim=0) == 1, relevant_idx)
+    pred_sinchan[~valid_idx.numpy(), ...] = 0
+    gt_sinchan[~valid_idx.numpy(), ...] = 0
 
     # Convert single-channel label prediction and ground truth to BGR
     pred_bgr = skimage.color.label2rgb(pred_sinchan, colors=palette)
@@ -251,7 +261,7 @@ def main():
     model.eval()
 
     # Get function handles of loss and metrics
-    loss_fn = getattr(torchseg.model.loss, config['loss'])
+    loss_fn = torchseg.model.loss.get_loss_function(config['loss'])
     metric_fns = [getattr(torchseg.model.metric, met) \
         for met in config['metrics']]
 
@@ -315,10 +325,24 @@ def main():
                     else:
                         total_metrics[i] += metric_value * batch_size
 
-        # Get best, median, worst image index
-        best_idx = np.argmax(im_acc) 
-        median_idx = np.argsort(im_acc)[len(im_acc) // 2]
-        worst_idx = np.argmin(im_acc) 
+        # Get best, median, worst image index. Some images may not contain any
+        # pixel from the tissue subset reported in the paper.
+        im_acc_array = np.asarray(im_acc, dtype=np.float64)
+        finite_idx = np.where(np.isfinite(im_acc_array))[0]
+        if finite_idx.size == 0:
+            best_idx = median_idx = worst_idx = 0
+            average_im_acc = float('nan')
+            min_im_acc = median_im_acc = max_im_acc = float('nan')
+        else:
+            finite_acc = im_acc_array[finite_idx]
+            best_idx = finite_idx[np.argmax(finite_acc)]
+            median_idx = finite_idx[np.argsort(finite_acc)[
+                finite_idx.size // 2]]
+            worst_idx = finite_idx[np.argmin(finite_acc)]
+            min_im_acc = im_acc_array[worst_idx]
+            median_im_acc = im_acc_array[median_idx]
+            max_im_acc = im_acc_array[best_idx]
+            average_im_acc = float(np.mean(finite_acc))
         
         # FIXME: debugging
         pred_bgr, gt_bgr = label2bgr(im_data[best_idx], im_pred[best_idx], im_gt[best_idx])
@@ -326,10 +350,10 @@ def main():
         cv2.imwrite('/tmp/gt_bgr.png', gt_bgr)
 
         # Calculate the final image-based accuracy
-        print('Image-based minimum accuracy:', im_acc[worst_idx])
-        print('Image-based median accuracy:', im_acc[median_idx])
-        print('Image-based maximum accuracy:', im_acc[best_idx])
-        print('Image-based average accuracy:', sum(im_acc) / len(im_acc))
+        print('Image-based minimum accuracy:', min_im_acc)
+        print('Image-based median accuracy:', median_im_acc)
+        print('Image-based maximum accuracy:', max_im_acc)
+        print('Image-based average accuracy:', average_im_acc)
         
         #print('Batch size:', batch_size)
         #print('Metric functions:', metric_fns)

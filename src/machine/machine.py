@@ -204,3 +204,140 @@ class GenericMachine(torchseg.base.BaseMachine):
             total = self.len_epoch
         return base.format(current, total, 100.0 * current / total)
 
+
+class UnmixingMachine(torchseg.base.BaseMachine):
+    """
+    @class Learning machine for self-supervised hyperspectral unmixing.
+    """
+    def __init__(self, model, criterion, metric_ftns, optimizer, config, device,
+                 data_loader, valid_data_loader=None, lr_scheduler=None,
+                 len_epoch=None, acc_steps=1):
+        super().__init__(model, criterion, metric_ftns, optimizer, config)
+        self.config = config
+        self.device = device
+        self.data_loader = data_loader
+        if len_epoch is None:
+            self.len_epoch = len(self.data_loader)
+        else:
+            self.data_loader = torchseg.utils.inf_loop(data_loader)
+            self.len_epoch = len_epoch
+        self.acc_steps = acc_steps
+        self.valid_data_loader = valid_data_loader
+        self.do_validation = self.valid_data_loader is not None
+        self.lr_scheduler = lr_scheduler
+        self.log_step = max(1, int(np.sqrt(data_loader.batch_size)))
+
+        self.train_metrics = torchseg.utils.MetricTracker('loss',
+            *[m.__name__ for m in self.metric_ftns], writer=self.writer)
+        self.valid_metrics = torchseg.utils.MetricTracker('loss',
+            *[m.__name__ for m in self.metric_ftns], writer=self.writer)
+
+    def _train_epoch(self, epoch):
+        self.model.train()
+        self.train_metrics.reset()
+        self.data_loader.training = True
+
+        acc_batches = 0
+        acc_loss = 0
+        self.optimizer.zero_grad()
+
+        for batch_idx, raw_data in enumerate(self.data_loader):
+            acc_batches += 1
+
+            data = raw_data['image'].to(self.device)
+            target = raw_data['target_reflectance'].to(self.device)
+
+            output = self.model(data)
+            if 'label' in raw_data and isinstance(output, dict):
+                output['label'] = raw_data['label'].to(self.device)
+
+            loss = self.criterion(output, target) / self.acc_steps
+            loss.backward()
+            acc_loss += loss.item()
+
+            if acc_batches == self.acc_steps:
+                self.logger.debug('Train Epoch: {} {} LR: {} Accumulated loss: {:.6f}'.format(
+                    epoch,
+                    self._progress(batch_idx),
+                    [group['lr'] for group in self.optimizer.param_groups],
+                    acc_loss))
+                self._optimizer_step()
+                acc_batches = 0
+                acc_loss = 0
+
+            self.writer.set_step((epoch - 1) * self.len_epoch + batch_idx)
+            self.train_metrics.update('loss', loss.item() * self.acc_steps)
+            for met in self.metric_ftns:
+                self.train_metrics.update(met.__name__, met(output, target))
+
+            if batch_idx % self.log_step == 0:
+                self.logger.debug('Train Epoch: {} {} LR: {} Loss: {:.6f}'.format(
+                    epoch,
+                    self._progress(batch_idx),
+                    [group['lr'] for group in self.optimizer.param_groups],
+                    loss.item() * self.acc_steps))
+
+            if batch_idx == self.len_epoch:
+                break
+
+        if acc_batches > 0:
+            self._optimizer_step()
+
+        log = self.train_metrics.result()
+
+        val_log = None
+        if self.do_validation:
+            val_log = self._valid_epoch(epoch)
+            log.update(**{'val_' + k: v for k, v in val_log.items()})
+
+        if self.lr_scheduler is not None:
+            if type(self.lr_scheduler) == \
+                    torch.optim.lr_scheduler.ReduceLROnPlateau:
+                scheduler_value = val_log['loss'] if val_log is not None \
+                    else log['loss']
+                self.lr_scheduler.step(scheduler_value)
+            else:
+                self.lr_scheduler.step()
+
+        return log
+
+    def _valid_epoch(self, epoch):
+        self.model.eval()
+        self.valid_metrics.reset()
+        self.data_loader.training = False
+
+        with torch.no_grad():
+            for batch_idx, raw_data in enumerate(self.valid_data_loader):
+                data = raw_data['image'].to(self.device)
+                target = raw_data['target_reflectance'].to(self.device)
+
+                output = self.model(data)
+                if 'label' in raw_data and isinstance(output, dict):
+                    output['label'] = raw_data['label'].to(self.device)
+
+                loss = self.criterion(output, target)
+
+                self.writer.set_step((epoch - 1) \
+                    * len(self.valid_data_loader) + batch_idx, 'valid')
+                self.valid_metrics.update('loss', loss.item())
+                for met in self.metric_ftns:
+                    self.valid_metrics.update(met.__name__, met(output, target))
+
+        return self.valid_metrics.result()
+
+    def _optimizer_step(self):
+        self.optimizer.step()
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model, 'clamp_decoder_weights'):
+            model.clamp_decoder_weights()
+        self.optimizer.zero_grad()
+
+    def _progress(self, batch_idx):
+        base = '[{}/{} ({:.0f}%)]'
+        if hasattr(self.data_loader, 'n_samples'):
+            current = batch_idx * self.data_loader.batch_size
+            total = self.data_loader.n_samples
+        else:
+            current = batch_idx
+            total = self.len_epoch
+        return base.format(current, total, 100.0 * current / total)

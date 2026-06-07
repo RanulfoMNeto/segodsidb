@@ -824,6 +824,72 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
             return im_hyper_new
 
         @staticmethod
+        def read_hyper_reflectance(path, mode, im_hyper=None, wl=None):
+            """
+            @returns a hyperspectral image with shape (H, W, C) and reflectance
+                     values in the same physical range used by the ODSI-DB
+                     segmentation preprocessing.
+            """
+            if mode not in OdsiDbDataLoader.mode2wl:
+                raise ValueError('[ERROR] The input mode ' + mode \
+                    + ' cannot be used as hyperspectral reflectance.')
+
+            if im_hyper is None or wl is None:
+                im_hyper, wl, _, metadata = torchseg.data_loader.read_stiff(path,
+                    silent=True, rgb_only=False)
+
+            # Get the target wavelength grid used by the segmentation pipeline.
+            new_wl = OdsiDbDataLoader.mode2wl[mode]
+            interp_func = dl.OdsiDbDataLoader.LoadImage.interp_spectra
+
+            if mode in ['spixel_204', 'simage_204'] and im_hyper.shape[2] == 51:
+                # Nuance EX images do not cover the full 400-1000 nm range.
+                # This mirrors the existing segmentation preprocessing for
+                # the 204-band modes.
+                inside_indices = np.array([idx for idx, x in enumerate(new_wl.tolist()) \
+                    if x > 450. and x < 950.])
+                inside_wl = new_wl[inside_indices]
+                inside_im = interp_func(im_hyper, wl, inside_wl)
+
+                nbands = 204
+                im = np.empty((im_hyper.shape[0], im_hyper.shape[1], nbands),
+                              dtype=inside_im.dtype)
+                j = 0
+                for i in range(nbands):
+                    if i < np.min(inside_indices):
+                        im[:, :, i] = inside_im[:, :, 0]
+                    elif i > np.max(inside_indices):
+                        im[:, :, i] = inside_im[:, :, -1]
+                    else:
+                        im[:, :, i] = inside_im[:, :, j]
+                        j += 1
+            else:
+                im = interp_func(im_hyper, wl, new_wl)
+
+            return im.astype(np.float32)
+
+        @staticmethod
+        def read_hyper_image_pair(path, mode, im_hyper=None, wl=None):
+            """
+            @returns a tuple (image, target_reflectance), both with shape
+                     (C, H, W). 'image' is z-score normalised exactly like the
+                     segmentation loader, while 'target_reflectance' stays in
+                     the ODSI-DB reflectance range for reconstruction losses.
+            """
+            target = OdsiDbDataLoader.LoadImage.read_hyper_reflectance(path,
+                                                                       mode,
+                                                                       im_hyper,
+                                                                       wl)
+            image = target.copy()
+            image -= OdsiDbDataLoader.mode2mean[mode]
+            image /= OdsiDbDataLoader.mode2std[mode]
+
+            image = image.transpose((2, 0, 1)).astype(np.float32)
+            target = target.transpose((2, 0, 1)).astype(np.float32)
+
+            return image, target
+
+        @staticmethod
         def read_image(path, mode, new_wl=np.linspace(400, 1000, 204)):
             """
             @returns an image with shape (c, h, w) containing values [0, 1].
@@ -851,7 +917,7 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
                 # Convert the image to (C, H, W)
                 im = im.transpose((2, 0, 1)).astype(np.float32)
 
-            elif mode in ['spixel_51', 'simage_51', 
+            elif mode in ['spixel_51', 'simage_51',
                           'spixel_170', 'spixel_170_test', 'simage_170', 'boiko']:
                 # In the ODSI-DB dataset there are images with 51 bands
                 # (450-950nm, both inclusive) and images with 204 bands
@@ -859,71 +925,12 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
                 #
                 # The boiko mode comes from "Deep Learning for Dental 
                 # Image Analysis" by Boiko et al. 2019
-
-                # Get the array of interpolated wavelengths according to the
-                # input mode selected by the user 
-                new_wl = OdsiDbDataLoader.mode2wl[mode]
-
-                # Interpolate hyperspectral image to the requested range
-                interp_func = dl.OdsiDbDataLoader.LoadImage.interp_spectra
-                im = interp_func(im_hyper, wl, new_wl)
-
-                # Center and scale the image
-                im -= OdsiDbDataLoader.mode2mean[mode]
-                im /= OdsiDbDataLoader.mode2std[mode]
-
-                # Convert the image to (C, H, W)
-                im = im.transpose((2, 0, 1)).astype(np.float32)
+                im, _ = OdsiDbDataLoader.LoadImage.read_hyper_image_pair(
+                    path, mode, im_hyper, wl)
 
             elif mode in ['spixel_204', 'simage_204']:
-                # Get the array of interpolated wavelengths according to the
-                # input mode selected by the user 
-                new_wl = OdsiDbDataLoader.mode2wl[mode]
-
-                # Get the function that will interpolate the hyperspectral
-                # images into a fixed set of wavelengths
-                interp_func = dl.OdsiDbDataLoader.LoadImage.interp_spectra
-                
-                # If the image comes from the Nuance EX, let's amend it
-                if im_hyper.shape[2] == 51:
-                    # Get an array of the wavelengths in [450, 950]
-                    inside_indices = np.array([idx for idx, x in enumerate(new_wl.tolist()) \
-                        if x > 450. and x < 950.])
-                    inside_wl = new_wl[inside_indices]
-
-                    # Interpolate hyperspectral image to the requested range
-                    inside_im = interp_func(im_hyper, wl, inside_wl)
-
-                    # Extrapolate to 204 bands 
-                    nbands = 204
-                    im = np.empty((im_hyper.shape[0], im_hyper.shape[1], nbands), 
-                                  dtype=inside_im.dtype)
-                    j = 0
-                    for i in range(nbands):
-                        if i < np.min(inside_indices):
-                            im[:, :, i] = inside_im[:, :, 0]
-                        elif i > np.max(inside_indices):
-                            im[:, :, i] = inside_im[:, :, -1]
-                        else:
-                            im[:, :, i] = inside_im[:, :, j] 
-                            j += 1
-
-                    # Center and scale the image
-                    im -= OdsiDbDataLoader.mode2mean[mode]
-                    im /= OdsiDbDataLoader.mode2std[mode]
-
-                    # Convert the image to (C, H, W)
-                    im = im.transpose((2, 0, 1)).astype(np.float32)
-                else:
-                    # Interpolate hyperspectral image to the requested range
-                    im = interp_func(im_hyper, wl, new_wl)
-                
-                    # Center and scale the image
-                    im -= OdsiDbDataLoader.mode2mean[mode]
-                    im /= OdsiDbDataLoader.mode2std[mode]
-
-                    # Convert the image to (C, H, W)
-                    im = im.transpose((2, 0, 1)).astype(np.float32)
+                im, _ = OdsiDbDataLoader.LoadImage.read_hyper_image_pair(
+                    path, mode, im_hyper, wl)
             else:
                 raise ValueError('[ERROR] ODSI-DB mode unknown.')
 
@@ -962,6 +969,71 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
             #label[class2idx['Background'], label.sum(axis=0) == 0] = 1
 
             return label
+
+        @staticmethod
+        def infer_label_path(image_path):
+            """
+            @brief Infer the ODSI-DB mask path for an HSI image path.
+            @returns Absolute mask path if found, otherwise None.
+            """
+            image_path = os.path.abspath(os.path.expanduser(str(image_path)))
+            root, ext = os.path.splitext(image_path)
+            candidates = []
+            if ext:
+                candidates.append(root + '_masks' + ext)
+            candidates.append(image_path + '_masks.tif')
+
+            for candidate in candidates:
+                if os.path.isfile(candidate):
+                    return candidate
+            return None
+
+        @staticmethod
+        def present_label_class_info(label_path, min_pixels=1):
+            """
+            @brief Return ODSI-DB classes with positive pixels in a mask.
+            @details Uses class indices from OdsiDbDataset.classnames, so any
+                     downstream class-index maps share the same colour palette.
+            """
+            label = OdsiDbDataLoader.LoadImage.read_label(label_path)
+            class_pixels = np.count_nonzero(label > 0, axis=(1, 2))
+            idx2class = OdsiDbDataLoader.OdsiDbDataset.classnames
+
+            info = []
+            for class_idx, pixels in enumerate(class_pixels.tolist()):
+                pixels = int(pixels)
+                if pixels >= int(min_pixels):
+                    info.append({
+                        'class_index': int(class_idx),
+                        'class_name': idx2class[int(class_idx)],
+                        'pixels': pixels,
+                    })
+            return info
+
+        @staticmethod
+        def present_label_class_info_from_image(image_path, mask_path=None,
+                                                min_pixels=1):
+            """
+            @brief Infer/read an image mask and list classes present in it.
+            @returns tuple (class_info, resolved_mask_path). If no mask is
+                     available and mask_path was not explicitly provided,
+                     returns (None, None).
+            """
+            if mask_path is None:
+                mask_path = OdsiDbDataLoader.LoadImage.infer_label_path(
+                    image_path)
+                if mask_path is None:
+                    return None, None
+            else:
+                mask_path = os.path.abspath(os.path.expanduser(str(mask_path)))
+
+            if not os.path.isfile(mask_path):
+                raise FileNotFoundError(
+                    '[ERROR] ODSI-DB mask file does not exist: {}'.format(
+                        mask_path))
+
+            return OdsiDbDataLoader.LoadImage.present_label_class_info(
+                mask_path, min_pixels=min_pixels), mask_path
 
         def forward(self, data):
             """
@@ -1352,4 +1424,340 @@ class OdsiDbDataLoader(torchseg.base.BaseDataLoader):
         new_label = label[:, off_row:off_row + crop_h, off_col:off_col + crop_w]
 
         return new_image, new_label
+
+
+class OdsiDbUnmixingDataLoader(torchseg.base.BaseDataLoader):
+    """
+    @class Loader for self-supervised ODSI-DB hyperspectral unmixing.
+    @details The encoder input uses the same z-score preprocessing as
+             OdsiDbDataLoader, while target_reflectance keeps physical
+             reflectance values for reconstruction.
+    """
+
+    class OdsiDbUnmixingDataset(torch.utils.data.Dataset):
+        def __init__(self, data_dir, mode='simage_170', patch_size=40,
+                     num_patches=250):
+            assert(mode in ['simage_51', 'simage_170', 'simage_204'])
+            self.data_dir = data_dir
+            self.mode = mode
+            self.patch_size = patch_size
+            self.num_patches = num_patches
+            self._cache_index = None
+            self._cache_hyper = None
+            self._cache_wl = None
+            self._cache_label = None
+
+            tiffs = [f for f in torchseg.utils.listdir(self.data_dir) \
+                if '.tif' in f]
+            segs = [f for f in tiffs if f.endswith('_masks.tif')]
+            imgs = [f.replace('_masks.tif', '.tif') for f in segs]
+            for im in imgs:
+                assert(os.path.isfile(os.path.join(data_dir, im)))
+
+            self.data = [{
+                'image': os.path.join(data_dir, im),
+                'label': os.path.join(data_dir, seg)} \
+                    for im, seg in zip(imgs, segs)]
+
+        def __len__(self):
+            return len(self.data) * self.num_patches
+
+        def __getitem__(self, index):
+            image_idx = index // self.num_patches
+            item = self.data[image_idx]
+
+            im_hyper, wl, label = self._load_image(image_idx)
+
+            im_hyper, label, crop_row, crop_col = \
+                OdsiDbUnmixingDataLoader.random_crop_hyper_and_label(
+                    im_hyper, label, self.patch_size, self.patch_size)
+            image, target = OdsiDbDataLoader.LoadImage.read_hyper_image_pair(
+                item['image'], self.mode, im_hyper=im_hyper, wl=wl)
+
+            image = torch.from_numpy(image)
+            target = torch.from_numpy(target)
+            label = torch.from_numpy(label)
+
+            return {
+                'image': image,
+                'target_reflectance': target,
+                'label': label,
+                'mode': self.mode,
+                'path': item['image'],
+                'crop_row': crop_row,
+                'crop_col': crop_col,
+                'patch_size': self.patch_size,
+            }
+
+        def _load_image(self, image_idx):
+            if self._cache_index == image_idx:
+                return self._cache_hyper, self._cache_wl, self._cache_label
+
+            item = self.data[image_idx]
+            im_hyper, wl, _, _ = torchseg.data_loader.read_stiff(item['image'],
+                silent=True, rgb_only=False)
+            label = OdsiDbDataLoader.LoadImage.read_label(item['label'])
+
+            self._cache_index = image_idx
+            self._cache_hyper = im_hyper
+            self._cache_wl = wl
+            self._cache_label = label
+
+            return im_hyper, wl, label
+
+    class ImagePatchSampler(torch.utils.data.Sampler):
+        """
+        @brief Yield patch indices grouped by image.
+        @details STIFF files are expensive to load. Grouping keeps batches on
+                 one image whenever possible, allowing the dataset cache to
+                 reuse the already-read hyperspectral cube.
+        """
+
+        def __init__(self, image_indices, num_patches, shuffle=True):
+            self.image_indices = list(image_indices)
+            self.num_patches = num_patches
+            self.shuffle = shuffle
+
+        def __iter__(self):
+            image_indices = self.image_indices
+            if self.shuffle:
+                order = torch.randperm(len(image_indices)).tolist()
+                image_indices = [image_indices[i] for i in order]
+
+            for image_idx in image_indices:
+                start = image_idx * self.num_patches
+                for patch_idx in range(self.num_patches):
+                    yield start + patch_idx
+
+        def __len__(self):
+            return len(self.image_indices) * self.num_patches
+
+    def __init__(self, data_dir, batch_size, mode='simage_170', shuffle=True,
+            validation_split=0.0, num_workers=1, patch_size=40,
+            num_patches=250):
+        self.data_dir = data_dir
+        self.mode = mode
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+
+        self.dataset = OdsiDbUnmixingDataLoader.OdsiDbUnmixingDataset(
+            self.data_dir, mode=self.mode, patch_size=self.patch_size,
+            num_patches=self.num_patches)
+
+        super().__init__(self.dataset, batch_size, shuffle, validation_split,
+            num_workers)
+
+    def _split_sampler(self, split):
+        """
+        @brief Split at image level so validation patches do not come from
+               images used for training.
+        """
+        if split == 0.0:
+            if self.shuffle:
+                image_indices = np.arange(len(self.dataset.data)).tolist()
+                sampler = OdsiDbUnmixingDataLoader.ImagePatchSampler(
+                    image_indices, self.num_patches, shuffle=True)
+                self.shuffle = False
+                self.n_samples = len(sampler)
+                return sampler, None
+            return None, None
+
+        n_images = len(self.dataset.data)
+        if isinstance(split, int):
+            assert(split > 0 and split < n_images)
+            len_valid = split
+        else:
+            len_valid = int(n_images * split)
+
+        idx_full = np.arange(n_images)
+        np.random.seed(0)
+        np.random.shuffle(idx_full)
+
+        valid_images = idx_full[0:len_valid]
+        train_images = np.delete(idx_full, np.arange(0, len_valid))
+
+        train_sampler = OdsiDbUnmixingDataLoader.ImagePatchSampler(
+            train_images.tolist(), self.num_patches, shuffle=True)
+        valid_sampler = OdsiDbUnmixingDataLoader.ImagePatchSampler(
+            valid_images.tolist(), self.num_patches, shuffle=False)
+
+        self.shuffle = False
+        self.n_samples = len(train_sampler)
+
+        return train_sampler, valid_sampler
+
+    @staticmethod
+    def random_crop_hyper_and_label(image, label, crop_h, crop_w):
+        """
+        @param[in]  image   Numpy array, shape (H, W, C).
+        @param[in]  label   Numpy array, shape (C, H, W).
+        @details Crop before interpolation so DataLoader workers never keep
+                 full-resolution z-scored/target tensors alive for each patch.
+        """
+        h = image.shape[0]
+        w = image.shape[1]
+        assert(h >= crop_h)
+        assert(w >= crop_w)
+
+        if crop_h < h:
+            off_row = np.random.randint(0, h - crop_h, size=1)[0]
+        else:
+            off_row = 0
+        if crop_w < w:
+            off_col = np.random.randint(0, w - crop_w, size=1)[0]
+        else:
+            off_col = 0
+
+        image = image[off_row:off_row + crop_h,
+                      off_col:off_col + crop_w, :].copy()
+        label = label[:, off_row:off_row + crop_h,
+                      off_col:off_col + crop_w].copy()
+
+        return image, label, off_row, off_col
+
+
+class OdsiDbSingleImageUnmixingDataLoader(torchseg.base.BaseDataLoader):
+    """
+    @class Loader for self-supervised CNNAEU unmixing on one HSI scene.
+    @details The dataset samples a fixed, deterministic list of patches from a
+             single STIFF image. Train/validation splits are made over patch
+             indices so validation remains a holdout from the same scene.
+    """
+
+    class OdsiDbSingleImageUnmixingDataset(torch.utils.data.Dataset):
+        def __init__(self, image_path, mode='simage_170', patch_size=40,
+                     num_patches=250, seed=0):
+            assert(mode in ['simage_51', 'simage_170', 'simage_204'])
+            self.image_path = os.path.abspath(os.path.expanduser(image_path))
+            self.mode = mode
+            self.patch_size = patch_size
+            self.num_patches = num_patches
+            self.seed = seed
+
+            if not os.path.isfile(self.image_path):
+                raise FileNotFoundError(
+                    '[ERROR] HSI image file does not exist: {}'.format(
+                        self.image_path))
+
+            self._hyper, self._wl, _, _ = torchseg.data_loader.read_stiff(
+                self.image_path, silent=True, rgb_only=False)
+            h, w, _ = self._hyper.shape
+            if self.patch_size > h or self.patch_size > w:
+                raise ValueError(
+                    '[ERROR] patch_size={} is larger than image size {}x{}.'
+                    .format(self.patch_size, h, w))
+
+            self.patch_coords = self._make_patch_coords()
+            self.data = [{'image': self.image_path}]
+
+        def _make_patch_coords(self):
+            h, w, _ = self._hyper.shape
+            rng = np.random.RandomState(self.seed)
+            coords = []
+            for _ in range(self.num_patches):
+                if h == self.patch_size:
+                    row = 0
+                else:
+                    row = int(rng.randint(0, h - self.patch_size + 1))
+                if w == self.patch_size:
+                    col = 0
+                else:
+                    col = int(rng.randint(0, w - self.patch_size + 1))
+                coords.append((row, col))
+            return coords
+
+        def __len__(self):
+            return self.num_patches
+
+        def __getitem__(self, index):
+            row, col = self.patch_coords[index]
+            patch_hyper = self._hyper[
+                row:row + self.patch_size,
+                col:col + self.patch_size,
+                :].copy()
+            image, target = OdsiDbDataLoader.LoadImage.read_hyper_image_pair(
+                self.image_path, self.mode, im_hyper=patch_hyper, wl=self._wl)
+
+            return {
+                'image': torch.from_numpy(image),
+                'target_reflectance': torch.from_numpy(target),
+                'mode': self.mode,
+                'path': self.image_path,
+                'crop_row': row,
+                'crop_col': col,
+                'patch_size': self.patch_size,
+            }
+
+        def load_full_image(self):
+            return self._hyper, self._wl
+
+    class PatchIndexSampler(torch.utils.data.Sampler):
+        def __init__(self, indices, shuffle=False, seed=0):
+            self.indices = list(indices)
+            self.shuffle = shuffle
+            self.seed = seed
+
+        def __iter__(self):
+            indices = self.indices
+            if self.shuffle:
+                generator = torch.Generator()
+                generator.manual_seed(self.seed)
+                order = torch.randperm(len(indices), generator=generator)
+                indices = [indices[i] for i in order.tolist()]
+            for idx in indices:
+                yield idx
+
+        def __len__(self):
+            return len(self.indices)
+
+    def __init__(self, image_path, batch_size, mode='simage_170',
+            shuffle=True, validation_split=0.0, num_workers=1,
+            patch_size=40, num_patches=250, seed=0):
+        self.image_path = image_path
+        self.mode = mode
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        self.seed = seed
+
+        self.dataset = \
+            OdsiDbSingleImageUnmixingDataLoader \
+            .OdsiDbSingleImageUnmixingDataset(
+                self.image_path, mode=self.mode, patch_size=self.patch_size,
+                num_patches=self.num_patches, seed=self.seed)
+
+        super().__init__(self.dataset, batch_size, shuffle, validation_split,
+            num_workers)
+
+    def _split_sampler(self, split):
+        if split == 0.0:
+            return None, None
+
+        n_patches = len(self.dataset)
+        if isinstance(split, int):
+            assert(split > 0 and split < n_patches)
+            len_valid = split
+        else:
+            len_valid = int(n_patches * split)
+            if split > 0.0:
+                len_valid = max(1, len_valid)
+        if len_valid >= n_patches:
+            raise ValueError(
+                '[ERROR] validation_split leaves no training patches.')
+
+        rng = np.random.RandomState(self.seed)
+        indices = np.arange(n_patches)
+        rng.shuffle(indices)
+
+        valid_idx = indices[:len_valid].tolist()
+        train_idx = indices[len_valid:].tolist()
+
+        train_sampler = OdsiDbSingleImageUnmixingDataLoader.PatchIndexSampler(
+            train_idx, shuffle=self.shuffle, seed=self.seed)
+        valid_sampler = OdsiDbSingleImageUnmixingDataLoader.PatchIndexSampler(
+            valid_idx, shuffle=False, seed=self.seed)
+
+        self.shuffle = False
+        self.n_samples = len(train_sampler)
+
+        return train_sampler, valid_sampler
         

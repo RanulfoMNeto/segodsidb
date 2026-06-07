@@ -1,0 +1,75 @@
+{
+    "name": "odsi_db_single_image_cnnaeu_simage_170_quick",
+    "n_gpu": 1,
+    "unmixing": {
+        "auto_from_training_mask": true,
+        "auto_min_pixels": 1,
+        "manifest_auto_update": true,
+        "manifest_path": "auto"
+    },
+    "model": {
+        "type": "CNNAEU",
+        "args": {
+            "in_channels": 170,
+            "num_endmembers": "auto",
+            "encoder_filters": 48,
+            "encoder_kernel_size": 3,
+            "decoder_kernel_size": 13,
+            "softmax_scale": 3.0,
+            "dropout": 0.2,
+            "negative_slope": 0.02,
+            "initializer_std": 0.3
+        }
+    },
+    "data_loader": {
+        "type": "OdsiDbSingleImageUnmixingDataLoader",
+        "args": {
+            "image_path": "odsi_db/dataset/example.tif",
+            "batch_size": 32,
+            "shuffle": true,
+            "validation_split": 0.1,
+            "num_workers": 2,
+            "mode": "simage_170",
+            "patch_size": 32,
+            "num_patches": 200,
+            "seed": 0
+        }
+    },
+    "optimizer": {
+        "type": "RMSprop",
+        "args": {
+            "lr": 0.003,
+            "weight_decay": 0.0
+        }
+    },
+    "loss": "sad_reconstruction_loss",
+    "metrics": [
+        "sad_reconstruction_metric",
+        "rmse_reconstruction",
+        "reconstruction_min",
+        "reconstruction_max",
+        "reconstruction_mean",
+        "target_reflectance_min",
+        "target_reflectance_max",
+        "target_reflectance_mean",
+        "asc_error",
+        "abundance_nonnegativity_violation",
+        "decoder_weight_nonnegativity_violation",
+        "endmember_min",
+        "endmember_max",
+        "endmember_mean"
+    ],
+    "machine": {
+        "type": "UnmixingMachine",
+        "args": {
+            "epochs": 30,
+            "save_dir": "saved/",
+            "save_period": 5,
+            "verbosity": 1,
+            "monitor": "min val_loss",
+            "early_stop": 8,
+            "tensorboard": false,
+            "acc_steps": 1
+        }
+    }
+}

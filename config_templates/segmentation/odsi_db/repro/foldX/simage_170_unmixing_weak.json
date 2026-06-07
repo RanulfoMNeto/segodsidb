@@ -1,0 +1,71 @@
+{
+    "name": "odsi_db_foldX_simage_170_unmixing_weak",
+    "n_gpu": 1,
+    "experiment": {
+        "label_source": "unmixing_weak_expanded",
+        "baseline_config": "config_templates/segmentation/odsi_db/repro/foldX/simage_170.json"
+    },
+    "model": {
+        "type": "SimpleUnet",
+        "args": {
+            "in_channels": 170,
+            "out_channels": 35
+        }
+    },
+    "data_loader": {
+        "type": "OdsiDbDataLoader",
+        "args": {
+            "data_dir": "generated/odsi_db_weak/foldX/train",
+            "batch_size": 1,
+            "shuffle": true,
+            "validation_split": 0.0,
+            "num_workers": 2,
+            "mode": "simage_170"
+        }
+    },
+    "optimizer": {
+        "type": "SGD",
+        "args": {
+            "lr": 1e-2,
+            "weight_decay": 0.0005,
+            "momentum": 0.99
+        }
+    },
+    "loss": "odsi_db_pw_ce_logprob_loss",
+    "metrics": [
+        "odsi_db_mean_iou",
+        "odsi_db_balanced_accuracy",
+        "odsi_db_accuracy",
+        "odsi_db_precision",
+        "odsi_db_sensitivity",
+        "odsi_db_f1_score"
+    ],
+    "machine": {
+        "type": "GenericMachine",
+        "args": {
+            "epochs": 20,
+            "save_dir": "saved/",
+            "save_period": 1,
+            "verbosity": 2,
+            "monitor": "min loss",
+            "early_stop": 6,
+            "tensorboard": false,
+            "acc_steps": 1
+        }
+    },
+    "testing": {
+        "datasets": [
+            {
+                "type": "OdsiDbDataLoader",
+                "args": {
+                    "data_dir": "generated/odsi_db/folds/foldX/test",
+                    "batch_size": 1,
+                    "shuffle": false,
+                    "validation_split": 0.0,
+                    "num_workers": 1,
+                    "mode": "simage_170"
+                }
+            }
+        ]
+    }
+}

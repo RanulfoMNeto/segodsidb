@@ -8,9 +8,67 @@ import torch
 import numpy as np
 import monai.metrics
 import torchvision
+import scipy.optimize
 
 # My imports
 import torchseg.data_loader as dl
+
+
+ODSI_DB_UNMIXING_RELEVANT_CLASS_NAMES = [
+    "Skin", "Oral mucosa", "Enamel", "Tongue", "Lip", "Hard palate",
+    "Attached gingiva", "Soft palate", "Hair", "Prosthetics",
+]
+
+ODSI_DB_UNMIXING_DEFAULT_RELEVANT_CLASS_NAMES = \
+    ODSI_DB_UNMIXING_RELEVANT_CLASS_NAMES.copy()
+
+
+def set_odsi_db_unmixing_relevant_class_names(class_names=None):
+    """
+    @brief Configure which ODSI-DB classes are used as semantic reference
+           spectra for unmixing evaluation/mapping.
+    @details This list is intentionally independent from R. For example,
+             R can be 10 while only Enamel and Prosthetics are used as
+             reference classes; the remaining estimated endmembers stay
+             unmapped unless assigned to one of those references.
+    """
+    if class_names is None:
+        class_names = ODSI_DB_UNMIXING_DEFAULT_RELEVANT_CLASS_NAMES
+
+    class_names = [str(name) for name in class_names]
+    if len(class_names) == 0:
+        raise ValueError('At least one ODSI-DB unmixing reference class is '
+                         'required.')
+    if len(set(class_names)) != len(class_names):
+        raise ValueError('Duplicate ODSI-DB unmixing reference classes: '
+                         '{}'.format(class_names))
+
+    valid_names = set(dl.OdsiDbDataLoader.OdsiDbDataset.classnames.values())
+    invalid_names = [name for name in class_names if name not in valid_names]
+    if invalid_names:
+        raise ValueError('Unknown ODSI-DB unmixing reference classes: '
+                         '{}'.format(invalid_names))
+
+    ODSI_DB_UNMIXING_RELEVANT_CLASS_NAMES[:] = class_names
+    return ODSI_DB_UNMIXING_RELEVANT_CLASS_NAMES.copy()
+
+
+def configure_odsi_db_unmixing_from_config(config):
+    """
+    @brief Apply unmixing.reference_class_names from a config dictionary.
+    @returns The active reference class names.
+    """
+    if hasattr(config, 'config'):
+        config = config.config
+
+    class_names = None
+    if isinstance(config, dict):
+        unmixing_config = config.get('unmixing', {})
+        class_names = unmixing_config.get('reference_class_names')
+        if class_names is None:
+            class_names = unmixing_config.get('relevant_class_names')
+
+    return set_odsi_db_unmixing_relevant_class_names(class_names)
 
 
 def accuracy(pred, gt):
@@ -45,6 +103,339 @@ def top_k_acc(pred, gt, k=3):
         for i in range(k):
             correct += torch.sum(pred[:, i] == gt).item()
     return correct / len(gt)
+
+
+def _reconstruction_from_output(pred):
+    if isinstance(pred, dict):
+        return pred['reconstruction']
+    return pred
+
+
+def sad_reconstruction_metric(pred, gt, eps=1e-8):
+    with torch.no_grad():
+        pred = _reconstruction_from_output(pred)
+        pred_norm = torch.nn.functional.normalize(pred, p=2, dim=1, eps=eps)
+        gt_norm = torch.nn.functional.normalize(gt, p=2, dim=1, eps=eps)
+        cosine = torch.sum(pred_norm * gt_norm, dim=1)
+        cosine = torch.clamp(cosine, min=-1.0 + eps, max=1.0)
+        cosine = torch.where(cosine > 1.0 - 1e-6,
+                             torch.ones_like(cosine), cosine)
+        return torch.acos(cosine).mean().item()
+
+
+def rmse_reconstruction(pred, gt):
+    with torch.no_grad():
+        pred = _reconstruction_from_output(pred)
+        return torch.sqrt(torch.mean((pred - gt) ** 2)).item()
+
+
+def reconstruction_min(pred, gt=None):
+    with torch.no_grad():
+        pred = _reconstruction_from_output(pred)
+        return pred.min().item()
+
+
+def reconstruction_max(pred, gt=None):
+    with torch.no_grad():
+        pred = _reconstruction_from_output(pred)
+        return pred.max().item()
+
+
+def reconstruction_mean(pred, gt=None):
+    with torch.no_grad():
+        pred = _reconstruction_from_output(pred)
+        return pred.mean().item()
+
+
+def target_reflectance_min(pred, gt):
+    with torch.no_grad():
+        return gt.min().item()
+
+
+def target_reflectance_max(pred, gt):
+    with torch.no_grad():
+        return gt.max().item()
+
+
+def target_reflectance_mean(pred, gt):
+    with torch.no_grad():
+        return gt.mean().item()
+
+
+def asc_error(pred, gt=None):
+    with torch.no_grad():
+        abundances = pred['abundances']
+        return torch.mean(torch.abs(torch.sum(abundances, dim=1) - 1.0)).item()
+
+
+def abundance_nonnegativity_violation(pred, gt=None, tol=0.0):
+    with torch.no_grad():
+        abundances = pred['abundances']
+        return torch.mean((abundances < -tol).float()).item()
+
+
+def decoder_weight_nonnegativity_violation(pred, gt=None, tol=0.0):
+    with torch.no_grad():
+        endmembers = pred['endmembers']
+        return torch.mean((endmembers < -tol).float()).item()
+
+
+def endmember_min(pred, gt=None):
+    with torch.no_grad():
+        return pred['endmembers'].min().item()
+
+
+def endmember_max(pred, gt=None):
+    with torch.no_grad():
+        return pred['endmembers'].max().item()
+
+
+def endmember_mean(pred, gt=None):
+    with torch.no_grad():
+        return pred['endmembers'].mean().item()
+
+
+def _odsi_db_relevant_class_indices(device):
+    idx2class = dl.OdsiDbDataLoader.OdsiDbDataset.classnames
+    class2idx = {y: x for x, y in idx2class.items()}
+    return torch.tensor(
+        [class2idx[x] for x in ODSI_DB_UNMIXING_RELEVANT_CLASS_NAMES],
+        device=device, dtype=torch.long)
+
+
+def odsi_db_unmixing_label_subset(labels, n_endmembers):
+    """
+    @brief Return labels used for semantic unmixing evaluation and the
+           corresponding original ODSI-DB class indices.
+    @details The configured relevant-class list is independent from R. This
+             allows experiments such as R=10 with only Enamel/Prosthetics as
+             reference classes. For non-ODSI label tensors, all channels are
+             kept.
+    """
+    if labels.shape[1] == len(dl.OdsiDbDataLoader.OdsiDbDataset.classnames):
+        class_indices = _odsi_db_relevant_class_indices(labels.device)
+        return labels[:, class_indices, :, :], class_indices
+
+    class_indices = torch.arange(labels.shape[1], device=labels.device,
+                                 dtype=torch.long)
+    return labels, class_indices
+
+
+def odsi_db_unmixing_reference_sums(target_reflectance, labels,
+                                    n_endmembers):
+    """
+    @brief Accumulate class reference spectra from annotated pixels.
+    @details The returned spectra are not external library spectra; they are
+             class-mean reflectance spectra computed from the labelled pixels
+             available in the supplied split.
+    @returns tuple (spectral_sums, pixel_counts, class_indices), where
+             spectral_sums has shape (C_eval, bands).
+    """
+    labels, class_indices = odsi_db_unmixing_label_subset(
+        labels, n_endmembers)
+
+    valid = torch.sum(labels, dim=1, keepdim=True) == 1
+    labels = labels.float() * valid.float()
+
+    counts = labels.sum(dim=(0, 2, 3))
+    spectral_sums = torch.einsum(
+        'blhw,bkhw->kl', target_reflectance.float(), labels)
+    return spectral_sums, counts, class_indices
+
+
+def odsi_db_unmixing_reference_endmembers(target_reflectance, labels,
+                                          n_endmembers):
+    """
+    @brief Compute class-mean reference spectra from labelled pixels.
+    @returns tuple (reference_endmembers, pixel_counts, class_indices), where
+             reference_endmembers has shape (C_eval, bands).
+    """
+    spectral_sums, counts, class_indices = \
+        odsi_db_unmixing_reference_sums(target_reflectance, labels,
+                                        n_endmembers)
+    reference_endmembers = spectral_sums / counts.clamp_min(1.0).unsqueeze(1)
+    return reference_endmembers, counts, class_indices
+
+
+def odsi_db_unmixing_sad_cost_matrix(estimated_endmembers,
+                                     reference_endmembers, eps=1e-8):
+    """
+    @brief Pairwise SAD cost matrix between estimated and reference spectra.
+    @returns Tensor of shape (R, C_ref), in radians.
+    """
+    if torch.is_tensor(estimated_endmembers):
+        estimated = estimated_endmembers.detach().float()
+    else:
+        estimated = torch.as_tensor(estimated_endmembers, dtype=torch.float32)
+
+    if torch.is_tensor(reference_endmembers):
+        reference = reference_endmembers.detach().float()
+    else:
+        reference = torch.as_tensor(reference_endmembers, dtype=torch.float32)
+
+    if estimated.device != reference.device:
+        reference = reference.to(estimated.device)
+
+    estimated = torch.nn.functional.normalize(estimated, p=2, dim=1, eps=eps)
+    reference = torch.nn.functional.normalize(reference, p=2, dim=1, eps=eps)
+    cosine = estimated @ reference.transpose(0, 1)
+    cosine = torch.clamp(cosine, min=-1.0 + eps, max=1.0)
+    cosine = torch.where(cosine > 1.0 - 1e-6,
+                         torch.ones_like(cosine), cosine)
+    return torch.acos(cosine)
+
+
+def odsi_db_unmixing_hungarian_mapping_from_reference_endmembers(
+        estimated_endmembers, reference_endmembers, class_indices,
+        reference_valid=None, max_sad=None, device=None,
+        return_cost_matrix=False):
+    """
+    @brief Match estimated endmembers to class reference spectra using SAD.
+    @details This is the classical HU-style permutation correction: rows are
+             decoder endmembers, columns are reference spectra, and Hungarian
+             minimizes the total spectral angle.
+    @returns Tensor shape (R,) with original ODSI-DB class indices, or -1.
+    """
+    if torch.is_tensor(estimated_endmembers):
+        estimated = estimated_endmembers.detach().float().cpu()
+    else:
+        estimated = torch.as_tensor(
+            estimated_endmembers, dtype=torch.float32)
+
+    if torch.is_tensor(reference_endmembers):
+        reference = reference_endmembers.detach().float().cpu()
+    else:
+        reference = torch.as_tensor(
+            reference_endmembers, dtype=torch.float32)
+
+    if torch.is_tensor(class_indices):
+        class_indices = class_indices.detach().cpu().numpy()
+    else:
+        class_indices = np.asarray(class_indices, dtype=np.int64)
+
+    n_endmembers = estimated.shape[0]
+    mapping = np.full((n_endmembers,), -1, dtype=np.int64)
+
+    if estimated.numel() == 0 or reference.numel() == 0:
+        mapping = torch.as_tensor(mapping, device=device, dtype=torch.long)
+        if return_cost_matrix:
+            return mapping, np.empty((n_endmembers, 0), dtype=np.float64)
+        return mapping
+
+    cost_matrix = odsi_db_unmixing_sad_cost_matrix(
+        estimated, reference).cpu().numpy().astype(np.float64)
+
+    if reference_valid is None:
+        reference_valid = np.ones((reference.shape[0],), dtype=bool)
+    elif torch.is_tensor(reference_valid):
+        reference_valid = reference_valid.detach().cpu().numpy().astype(bool)
+    else:
+        reference_valid = np.asarray(reference_valid, dtype=bool)
+
+    finite_cols = np.isfinite(cost_matrix).all(axis=0)
+    valid_cols = np.where(np.logical_and(reference_valid, finite_cols))[0]
+    if len(valid_cols) == 0:
+        mapping = torch.as_tensor(mapping, device=device, dtype=torch.long)
+        if return_cost_matrix:
+            return mapping, cost_matrix
+        return mapping
+
+    row_ind, col_ind = scipy.optimize.linear_sum_assignment(
+        cost_matrix[:, valid_cols])
+    for row, valid_col_idx in zip(row_ind, col_ind):
+        col = valid_cols[valid_col_idx]
+        cost = cost_matrix[row, col]
+        if max_sad is not None and cost > max_sad:
+            continue
+        mapping[row] = class_indices[col]
+
+    mapping = torch.as_tensor(mapping, device=device, dtype=torch.long)
+    if return_cost_matrix:
+        return mapping, cost_matrix
+    return mapping
+
+
+def odsi_db_unmixing_spectral_hungarian_mapping(
+        estimated_endmembers, target_reflectance, labels, max_sad=None):
+    """
+    @brief Compute a spectral endmember->class mapping from labelled spectra.
+    """
+    n_endmembers = estimated_endmembers.shape[0]
+    reference_endmembers, counts, class_indices = \
+        odsi_db_unmixing_reference_endmembers(
+            target_reflectance, labels, n_endmembers)
+    return odsi_db_unmixing_hungarian_mapping_from_reference_endmembers(
+        estimated_endmembers, reference_endmembers, class_indices,
+        max_sad=max_sad, device=estimated_endmembers.device)
+
+
+def _odsi_db_unmixing_balanced_accuracy_from_mapping(abundances, labels,
+                                                     mapping):
+    n_endmembers = abundances.shape[1]
+    labels, class_indices = odsi_db_unmixing_label_subset(
+        labels, n_endmembers)
+
+    valid = torch.sum(labels, dim=1) == 1
+    if valid.sum().item() == 0:
+        return 0.0
+
+    mapping = torch.as_tensor(mapping, device=abundances.device,
+                              dtype=torch.long)
+    y_pred_endmember = torch.argmax(abundances, dim=1)[valid]
+    y_pred_class = mapping[y_pred_endmember]
+    y_true_relative = torch.argmax(labels, dim=1)[valid]
+    y_true_class = class_indices[y_true_relative]
+
+    scores = []
+    for class_idx in class_indices.tolist():
+        class_idx = int(class_idx)
+        true_pos_class = y_true_class == class_idx
+        pred_pos_class = y_pred_class == class_idx
+
+        tp = torch.logical_and(true_pos_class, pred_pos_class).sum().float()
+        tn = torch.logical_and(~true_pos_class, ~pred_pos_class).sum().float()
+        fp = torch.logical_and(~true_pos_class, pred_pos_class).sum().float()
+        fn = torch.logical_and(true_pos_class, ~pred_pos_class).sum().float()
+
+        sens_den = tp + fn
+        spec_den = tn + fp
+        if sens_den.item() == 0 or spec_den.item() == 0:
+            continue
+        scores.append((0.5 * (tp / sens_den + tn / spec_den)).item())
+
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
+
+
+def odsi_db_unmixing_hungarian_balanced_accuracy(pred, gt=None):
+    """
+    @brief Post-hoc semantic evaluation for unmixing abundance maps.
+    @details If pred contains semantic_mapping, that frozen mapping is used.
+             Otherwise, when target reflectance is provided, endmembers are
+             matched to class reference spectra by minimizing SAD. No
+             abundance-mask overlap matching is performed.
+    """
+    with torch.no_grad():
+        abundances = pred['abundances']
+        labels = pred.get('label')
+        if pred.get('disable_semantic_mapping', False):
+            return 0.0
+        if labels is None:
+            return 0.0
+
+        mapping = pred.get('semantic_mapping')
+        if mapping is not None:
+            return _odsi_db_unmixing_balanced_accuracy_from_mapping(
+                abundances, labels, mapping)
+
+        if gt is not None and 'endmembers' in pred:
+            mapping = odsi_db_unmixing_spectral_hungarian_mapping(
+                pred['endmembers'], gt, labels)
+            return _odsi_db_unmixing_balanced_accuracy_from_mapping(
+                abundances, labels, mapping)
+
+        return 0.0
 
 
 def iou(pred, gt, k=1):

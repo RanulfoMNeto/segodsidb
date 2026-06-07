@@ -130,7 +130,24 @@ dmypy.json
 
 # Project data and experiment artifacts
 /odsi_db/
+/odsi_db
+/data/
+/datasets/
+/generated/
+/hu_autoencoders/
 saved/
 results/
 logs/
+outputs/
+artifacts/
+checkpoints/
+wandb/
+mlruns/
 *.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
+*.keras
+/*.pdf
